@@ -9,10 +9,10 @@ from comfy.ldm.cascade.stage_c import StageC
 
 class StageUP(StageC):
     def __init__(self, c_in=16, c_out=16, c_r=64, patch_size=1, c_cond=2048, c_hidden=[2048, 2048], nhead=[32, 32],
-                 blocks=[[8, 24], [24, 8]], block_repeat=[[1, 1], [1, 1]], level_config=['CTA', 'CTA'],
-                 c_clip_text=1280, c_clip_text_pooled=1280, c_clip_img=768, c_clip_seq=4, kernel_size=3,
-                 dropout=[0.0, 0.0], self_attn=True, t_conds=['sca', 'crp'], switch_level=[False], stable_cascade_stage=None,
-                 dtype=None, device=None, operations=None):
+                blocks=[[8, 24], [24, 8]], block_repeat=[[1, 1], [1, 1]], level_config=['CTA', 'CTA'],
+                c_clip_text=1280, c_clip_text_pooled=1280, c_clip_img=768, c_clip_seq=4, kernel_size=3,
+                dropout=[0.0, 0.0], self_attn=True, t_conds=['sca', 'crp'], switch_level=[False], stable_cascade_stage=None,
+                dtype=None, device=None, operations=None):
 
         self.x_lr=None
         self.lr_guide=None 
@@ -28,10 +28,10 @@ class StageUP(StageC):
         self.blocks = blocks
             
         super().__init__(c_in=c_in, c_out=c_out, c_r=c_r, patch_size=patch_size, c_cond=c_cond, c_hidden=c_hidden, nhead=nhead,
-                 blocks=blocks, block_repeat=block_repeat, level_config=level_config,
-                 c_clip_text=c_clip_text, c_clip_text_pooled=c_clip_text_pooled, c_clip_img=c_clip_img, c_clip_seq=c_clip_seq, kernel_size=kernel_size,
-                 dropout=dropout, self_attn=self_attn, t_conds=t_conds, switch_level=switch_level, stable_cascade_stage=stable_cascade_stage,
-                 dtype=dtype, device=device, operations=operations)
+                blocks=blocks, block_repeat=block_repeat, level_config=level_config,
+                c_clip_text=c_clip_text, c_clip_text_pooled=c_clip_text_pooled, c_clip_img=c_clip_img, c_clip_seq=c_clip_seq, kernel_size=kernel_size,
+                dropout=dropout, self_attn=self_attn, t_conds=t_conds, switch_level=switch_level, stable_cascade_stage=stable_cascade_stage,
+                dtype=dtype, device=device, operations=operations)
         
     def set_guide_type(self, guide_type=None):
         self.guide_mode_weighted = True if guide_type == 'weighted' else False

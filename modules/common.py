@@ -6,6 +6,8 @@ import torch.nn.functional as F
 import einops
 import math
 
+from comfy.ldm.modules.attention import optimized_attention
+
 class Linear(torch.nn.Linear):
     def reset_parameters(self):
         return None
@@ -51,20 +53,20 @@ class UpDownBlock2d(nn.Module):
         return x
 
 
-class Attention(nn.Module):
+class Attention_original(nn.Module):
     def __init__(self, dim, n_head, head_dim, dropout=0.0):
         super().__init__()
         self.n_head = n_head
         inner_dim = n_head * head_dim
-        self.to_q = nn.Sequential(nn.SiLU(), Linear(dim, inner_dim))
+        self.to_q  = nn.Sequential(nn.SiLU(), Linear(dim, inner_dim))
         self.to_kv = nn.Sequential(nn.SiLU(), Linear(dim, inner_dim * 2))
         self.scale = head_dim**-0.5
 
     def forward(self, fr, to=None):
         if to is None:
             to = fr
-        q = self.to_q(fr)
-        k, v = self.to_kv(to).chunk(2, dim=-1)
+        q       = self.to_q(fr)
+        k, v    = self.to_kv(to).chunk(2, dim=-1)
         q, k, v = map(
             lambda t: einops.rearrange(t, "b n (h d) -> b h n d", h=self.n_head),
             [q, k, v],
@@ -72,10 +74,35 @@ class Attention(nn.Module):
 
         dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         attn = F.softmax(dots, dim=-1)  # b h n n
-        out = torch.matmul(attn, v)
+        out  = torch.matmul(attn, v)
+        out  = einops.rearrange(out, "b h n d -> b n (h d)")
+        return out
+    
+class Attention(nn.Module):
+    def __init__(self, dim, n_head, head_dim, dropout=0.0):
+        super().__init__()
+        self.n_head = n_head
+        inner_dim   = n_head * head_dim
+        self.to_q   = nn.Sequential(nn.SiLU(), nn.Linear(dim, inner_dim))
+        self.to_kv  = nn.Sequential(nn.SiLU(), nn.Linear(dim, inner_dim * 2))
+
+    def forward(self, fr, to=None):
+        if to is None:
+            to = fr
+        q    = self.to_q(fr)
+        k, v = self.to_kv(to).chunk(2, dim=-1)
+        x    = optimized_attention(q, k, v, heads=self.n_head)
+        return x
+        """
+        # -> [batch, heads, seq_len, head_dim]
+        q, k, v = map(lambda t: einops.rearrange(t, "b n (h d) -> b h n d", h=self.n_head), [q, k, v])
+        
+        # note: scaled dot product attention: applies scaling factor 1/sqrt(d) internally
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0, is_causal=False)
+        # -> [batch, seq_len, inner_dim]
         out = einops.rearrange(out, "b h n d -> b n (h d)")
         return out
-
+        """
 
 class FeedForward(nn.Module):
     def __init__(self, dim, ff_dim, dropout=0.0):
@@ -112,8 +139,8 @@ class TransformerEncoder(nn.Module):
             self.layers.append(
                 nn.ModuleList(
                     [
-                        PreNorm(dim, Attention(dim, n_head, head_dim, dropout=dropout)),
-                        PreNorm(dim, FeedForward(dim, ff_dim, dropout=dropout)),
+                        PreNorm(dim, Attention  (dim, n_head, head_dim, dropout=dropout)),
+                        PreNorm(dim, FeedForward(dim, ff_dim,           dropout=dropout)),
                     ]
                 )
             )
