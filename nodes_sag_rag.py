@@ -134,7 +134,7 @@ class UltraCascade_SelfAttentionGuidance:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
 
-    CATEGORY = "UltraCascade"
+    CATEGORY = "UltraCascade/attention"
 
     def patch(self, model, scale, blur_sigma, blur_size, mode, threshold, clamp):
         m = model.clone()
@@ -216,7 +216,7 @@ class UltraCascade_RandomAttentionGuidance:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "main"
 
-    CATEGORY = "UltraCascade"
+    CATEGORY = "UltraCascade/attention"
 
     def main(self, model, scale):
         unet_block = "middle"
@@ -261,7 +261,7 @@ class UltraCascade_PerturbedAttentionGuidance:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "main"
 
-    CATEGORY = "UltraCascade"
+    CATEGORY = "UltraCascade/attention"
 
     def main(self, model, scale):
         unet_block = "middle"
@@ -298,7 +298,7 @@ class UltraCascade_AttentionGuidance_Block:
     def forward(self, blah):
         return None
 
-class UltraCascade_AttentionGuidance:
+class UltraCascade_AdvancedAttentionGuidance:
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -320,7 +320,7 @@ class UltraCascade_AttentionGuidance:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "main"
 
-    CATEGORY = "UltraCascade"
+    CATEGORY = "UltraCascade/attention"
 
     def main(self, model, scale):
         unet_block = "middle"
@@ -360,12 +360,14 @@ NODE_CLASS_MAPPINGS = {
     "UltraCascade_SelfAttentionGuidance": UltraCascade_SelfAttentionGuidance,
     "UltraCascade_RandomAttentionGuidance": UltraCascade_RandomAttentionGuidance,
     "UltraCascade_PerturbedAttentionGuidance": UltraCascade_PerturbedAttentionGuidance,
+    "UltraCascade_AdvancedAttentionGuidance": UltraCascade_AdvancedAttentionGuidance,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "UltraCascade_SelfAttentionGuidance": "UltraCascade Self-Attention Guidance",
     "UltraCascade_RandomAttentionGuidance": "UltraCascade Random Attention Guidance",
     "UltraCascade_PerturbedAttentionGuidance": "UltraCascade Perturbed Attention Guidance",
+    "UltraCascade_AdvancedAttentionGuidance": "UltraCascade Advanced Attention Guidance"
 }
 
 

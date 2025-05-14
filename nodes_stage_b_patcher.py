@@ -3,6 +3,7 @@ from comfy.ldm.cascade.stage_c import StageC
 from .modules.stage_b2 import StageB2
 from .modules.stage_up import StageUP
 import types
+import torch
 
 class UltraCascade_StageB_Patcher:
     @classmethod
@@ -23,6 +24,10 @@ class UltraCascade_StageB_Patcher:
 
         model.model.diffusion_model.set_effnet_batch(None)
         model.model.diffusion_model.set_effnet_batch_maps(None)
+        
+        model.model.diffusion_model.style_dtype = torch.float64 #getattr(torch, style_dtype) if style_dtype != "default" else None
+        model.model.diffusion_model.proj_weights = None
+        model.model.diffusion_model.y0_adain_embed = None
 
         return (model,)
     
