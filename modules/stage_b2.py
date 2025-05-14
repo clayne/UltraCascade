@@ -21,7 +21,11 @@
 import math
 import torch
 from torch import nn
+import torch.nn.functional as F
 from comfy.ldm.cascade.common import AttnBlock, LayerNorm2d_op, ResBlock, FeedForwardBlock, TimestepBlock
+
+import copy
+from einops import rearrange
 
 class StageB2(nn.Module):
     def __init__(self, c_in=4, c_out=4, c_r=64, patch_size=2, c_cond=1280, c_hidden=[320, 640, 1280, 1280],
@@ -299,7 +303,57 @@ class StageB2(nn.Module):
     def set_effnet_batch_maps(self, effnet_batch_maps=None):
         self.effnet_batch_maps = effnet_batch_maps
 
+
+    def invert_unshuffle_conv(
+        self,
+        unshuffle: torch.nn.PixelUnshuffle,
+        conv1x1:   torch.nn.Conv2d,
+        y:         torch.Tensor,
+        original_shape: torch.Size
+    ) -> torch.Tensor:
+
+        conv1x1 = copy.deepcopy(conv1x1).to(torch.float64)
+        y = y.to(torch.float64)
+        
+        B, C_in, H, W = original_shape
+        r = unshuffle.downscale_factor
+        B2, C_out, Hr, Wr = y.shape
+        assert B2 == B
+        assert Hr == H//r and Wr == W//r
+
+        b = conv1x1.bias.view(1, C_out, 1, 1)
+        y_nobias = y - b
+
+        W = conv1x1.weight.view(C_out, -1) 
+        W_pinv = torch.linalg.pinv(W)  
+
+        y_flat = y_nobias.reshape(B, C_out, -1) 
+
+        x_unshuf_flat = W_pinv @ y_flat  
+        x_unshuf = x_unshuf_flat.view(B, C_in*r*r, Hr, Wr)
+
+        x_rec = F.pixel_shuffle(x_unshuf, upscale_factor=r) 
+        return x_rec
+
+
     def forward(self, x, r, effnet, clip, pixels=None, **kwargs):
+
+        transformer_options = kwargs['transformer_options']
+        SIGMA = transformer_options['sigmas'] # timestep[0].unsqueeze(0) #/ 1000
+        
+        y0_style_pos        = transformer_options.get("y0_style_pos")
+        y0_style_neg        = transformer_options.get("y0_style_neg")
+
+        y0_style_pos_weight    = transformer_options.get("y0_style_pos_weight",    0.0)
+        y0_style_pos_synweight = transformer_options.get("y0_style_pos_synweight", 0.0)
+        y0_style_pos_synweight *= y0_style_pos_weight
+
+        y0_style_neg_weight    = transformer_options.get("y0_style_neg_weight",    0.0)
+        y0_style_neg_synweight = transformer_options.get("y0_style_neg_synweight", 0.0)
+        y0_style_neg_synweight *= y0_style_neg_weight
+        
+        x_orig = x.clone()
+        
 
         if pixels is None:
             pixels = x.new_zeros(x.size(0), 3, 8, 8)
@@ -345,8 +399,186 @@ class StageB2(nn.Module):
         x = self._up_decode(level_outputs, r_embed, clip, pag_patch_flag=pag_patch_flag, sag_func=sag_func)
         
         x_clf = self.clf(x)
+        #return x_clf
+    
+        eps = x_clf
+
+
         
-        return x_clf
+        dtype = eps.dtype if self.style_dtype is None else self.style_dtype
+        pinv_dtype = torch.float32 if dtype != torch.float64 else dtype
+        W_inv = None
+        
+        
+        if eps.shape[0] == 2 or (eps.shape[0] == 1): #: and not UNCOND):
+            if y0_style_pos is not None and y0_style_pos_weight != 0.0:
+                y0_style_pos = y0_style_pos.to(torch.float64)
+                x   = x_orig.clone().to(torch.float64) * ((SIGMA ** 2 + 1) ** 0.5)
+                eps = eps.to(torch.float64)
+                eps_orig = eps.clone()
+            
+                sigma = SIGMA
+                denoised = x - sigma * eps
+
+                pixel_unshuffler = self.embedding[0]
+                x_embedder = copy.deepcopy(self.embedding[1]).to(denoised)
+                
+                denoised_embed = x_embedder(pixel_unshuffler(denoised))
+                y0_adain_embed = x_embedder(pixel_unshuffler(y0_style_pos))
+
+                denoised_embed = rearrange(denoised_embed, "B C H W -> B (H W) C")
+                y0_adain_embed = rearrange(y0_adain_embed, "B C H W -> B (H W) C")
+
+                if transformer_options['y0_style_method'] == "AdaIN":
+                    denoised_embed = adain_seq_inplace(denoised_embed, y0_adain_embed)
+                    """for adain_iter in range(EO("style_iter", 0)):
+                        denoised_embed = adain_seq_inplace(denoised_embed, y0_adain_embed)
+                        denoised_embed = (denoised_embed - b) @ torch.linalg.pinv(W.to(pinv_dtype)).T.to(dtype)
+                        denoised_embed = F.linear(denoised_embed.to(W), W, b).to(img)
+                        denoised_embed = adain_seq_inplace(denoised_embed, y0_adain_embed)"""
+                        
+                elif transformer_options['y0_style_method'] == "WCT":
+                    if self.y0_adain_embed is None or self.y0_adain_embed.shape != y0_adain_embed.shape or torch.norm(self.y0_adain_embed - y0_adain_embed) > 0:
+                        self.y0_adain_embed = y0_adain_embed
+                        
+                        f_s          = y0_adain_embed[0].clone()
+                        self.mu_s    = f_s.mean(dim=0, keepdim=True)
+                        f_s_centered = f_s - self.mu_s
+                        
+                        cov = (f_s_centered.transpose(-2,-1).double() @ f_s_centered.double()) / (f_s_centered.size(0) - 1)
+
+                        S_eig, U_eig = torch.linalg.eigh(cov + 1e-5 * torch.eye(cov.size(0), dtype=cov.dtype, device=cov.device))
+                        S_eig_sqrt    = S_eig.clamp(min=0).sqrt() # eigenvalues -> singular values
+                        
+                        whiten = U_eig @ torch.diag(S_eig_sqrt) @ U_eig.T
+                        self.y0_color  = whiten.to(f_s_centered)
+
+                    for wct_i in range(eps.shape[0]):
+                        f_c          = denoised_embed[wct_i].clone()
+                        mu_c         = f_c.mean(dim=0, keepdim=True)
+                        f_c_centered = f_c - mu_c
+                        
+                        cov = (f_c_centered.transpose(-2,-1).double() @ f_c_centered.double()) / (f_c_centered.size(0) - 1)
+
+                        S_eig, U_eig  = torch.linalg.eigh(cov + 1e-5 * torch.eye(cov.size(0), dtype=cov.dtype, device=cov.device))
+                        inv_sqrt_eig  = S_eig.clamp(min=0).rsqrt() 
+                        
+                        whiten = U_eig @ torch.diag(inv_sqrt_eig) @ U_eig.T
+                        whiten = whiten.to(f_c_centered)
+
+                        f_c_whitened = f_c_centered @ whiten.T
+                        f_cs         = f_c_whitened @ self.y0_color.T.to(f_c_whitened) + self.mu_s.to(f_c_whitened)
+                        
+                        denoised_embed[wct_i] = f_cs
+
+                
+                denoised_embed = rearrange(denoised_embed, "B (H W) C -> B C H W", W=eps.shape[-1] // 2)
+                denoised_approx = self.invert_unshuffle_conv(pixel_unshuffler, x_embedder, denoised_embed, x_orig.shape)
+                denoised_approx = denoised_approx.to(eps)
+
+                
+                eps = (x - denoised_approx) / sigma
+                
+                #UNCOND = transformer_options['cond_or_uncond'][cond_iter] == 1
+
+                if eps.shape[0] == 1 and transformer_options['cond_or_uncond'][0] == 1:
+                    eps[0] = eps_orig[0] + y0_style_neg_synweight * (eps[0] - eps_orig[0])
+                    #if eps.shape[0] == 2:
+                    #    eps[1] = eps_orig[1] + y0_style_neg_synweight * (eps[1] - eps_orig[1])
+                else: #if not UNCOND:
+                    if eps.shape[0] == 2:
+                        eps[1] = eps_orig[1] + y0_style_pos_weight * (eps[1] - eps_orig[1])
+                        eps[0] = eps_orig[0] + y0_style_pos_synweight * (eps[0] - eps_orig[0])
+                    else:
+                        eps[0] = eps_orig[0] + y0_style_pos_weight * (eps[0] - eps_orig[0])
+                
+                eps = eps.float()
+        
+        if eps.shape[0] == 2 or (eps.shape[0] == 1): # and UNCOND):
+            if y0_style_neg is not None and y0_style_neg_weight != 0.0:
+                y0_style_neg = y0_style_neg.to(torch.float64)
+                x   = x_orig.clone().to(torch.float64)* ((SIGMA ** 2 + 1) ** 0.5)
+                eps = eps.to(torch.float64)
+                eps_orig = eps.clone()
+                
+                sigma = SIGMA #t_orig[0].to(torch.float32) / 1000
+                denoised = x - sigma * eps
+
+                pixel_unshuffler = self.embedding[0]
+                x_embedder = copy.deepcopy(self.embedding[1]).to(denoised)
+                
+                denoised_embed = x_embedder(pixel_unshuffler(denoised))
+                y0_adain_embed = x_embedder(pixel_unshuffler(y0_style_neg))
+
+                denoised_embed = rearrange(denoised_embed, "B C H W -> B (H W) C")
+                y0_adain_embed = rearrange(y0_adain_embed, "B C H W -> B (H W) C")
+
+                if transformer_options['y0_style_method'] == "AdaIN":
+                    denoised_embed = adain_seq_inplace(denoised_embed, y0_adain_embed)
+                    """for adain_iter in range(EO("style_iter", 0)):
+                        denoised_embed = adain_seq_inplace(denoised_embed, y0_adain_embed)
+                        denoised_embed = (denoised_embed - b) @ torch.linalg.pinv(W.to(pinv_dtype)).T.to(dtype)
+                        denoised_embed = F.linear(denoised_embed.to(W), W, b).to(img)
+                        denoised_embed = adain_seq_inplace(denoised_embed, y0_adain_embed)"""
+                        
+                elif transformer_options['y0_style_method'] == "WCT":
+                    if self.y0_adain_embed is None or self.y0_adain_embed.shape != y0_adain_embed.shape or torch.norm(self.y0_adain_embed - y0_adain_embed) > 0:
+                        self.y0_adain_embed = y0_adain_embed
+                        
+                        f_s          = y0_adain_embed[0].clone()
+                        self.mu_s    = f_s.mean(dim=0, keepdim=True)
+                        f_s_centered = f_s - self.mu_s
+                        
+                        #cov = (f_s_centered.T.double() @ f_s_centered.double()) / (f_s_centered.size(0) - 1)
+                        cov = (f_s_centered.transpose(-2,-1).double() @ f_s_centered.double()) / (f_s_centered.size(0) - 1)
+
+                        S_eig, U_eig = torch.linalg.eigh(cov + 1e-5 * torch.eye(cov.size(0), dtype=cov.dtype, device=cov.device))
+                        S_eig_sqrt    = S_eig.clamp(min=0).sqrt() # eigenvalues -> singular values
+                        
+                        whiten = U_eig @ torch.diag(S_eig_sqrt) @ U_eig.T
+                        self.y0_color  = whiten.to(f_s_centered)
+
+                    for wct_i in range(eps.shape[0]):
+                        f_c          = denoised_embed[wct_i].clone()
+                        mu_c         = f_c.mean(dim=0, keepdim=True)
+                        f_c_centered = f_c - mu_c
+                        
+                        #cov = (f_c_centered.T.double() @ f_c_centered.double()) / (f_c_centered.size(0) - 1)
+                        cov = (f_c_centered.transpose(-2,-1).double() @ f_c_centered.double()) / (f_c_centered.size(0) - 1)
+
+                        S_eig, U_eig  = torch.linalg.eigh(cov + 1e-5 * torch.eye(cov.size(0), dtype=cov.dtype, device=cov.device))
+                        inv_sqrt_eig  = S_eig.clamp(min=0).rsqrt() 
+                        
+                        whiten = U_eig @ torch.diag(inv_sqrt_eig) @ U_eig.T
+                        whiten = whiten.to(f_c_centered)
+
+                        f_c_whitened = f_c_centered @ whiten.T
+                        f_cs         = f_c_whitened @ self.y0_color.T.to(f_c_whitened) + self.mu_s.to(f_c_whitened)
+                        
+                        denoised_embed[wct_i] = f_cs
+
+                denoised_embed = rearrange(denoised_embed, "B (H W) C -> B C H W", W=eps.shape[-1] // 2)
+                denoised_approx = self.invert_unshuffle_conv(pixel_unshuffler, x_embedder, denoised_embed, x_orig.shape)
+                denoised_approx = denoised_approx.to(eps)
+                
+                
+                if eps.shape[0] == 1 and not transformer_options['cond_or_uncond'][0] == 1:
+                    eps[0] = eps_orig[0] + y0_style_pos_synweight * (eps[0] - eps_orig[0])
+                else:
+                    eps = (x - denoised_approx) / sigma
+                    eps[0] = eps_orig[0] + y0_style_neg_weight * (eps[0] - eps_orig[0])
+                    if eps.shape[0] == 2:
+                        eps[1] = eps_orig[1] + y0_style_neg_synweight * (eps[1] - eps_orig[1])
+                
+            eps = eps.float()
+        
+        return eps
+
+
+
+
+
+    
 
     def update_weights_ema(self, src_model, beta=0.999):
         for self_params, src_params in zip(self.parameters(), src_model.parameters()):
